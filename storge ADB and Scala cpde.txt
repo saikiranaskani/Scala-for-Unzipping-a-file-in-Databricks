@@ -1,0 +1,79 @@
+%scala
+import scala.sys.process._
+import java.nio.file.{Files, Paths, Path}
+import scala.collection.JavaConverters._
+
+def readProcessedFilesLog(logPath: String): Set[String] = {
+  try {
+    dbutils.fs.head(logPath, 10000).split("\n").toSet // Adjust the byte limit if needed
+  } catch {
+    case _: Exception => Set.empty[String]  // If log file doesn't exist, return an empty set
+  }
+}
+
+def appendToProcessedFilesLog(logPath: String, fileName: String): Unit = {
+  dbutils.fs.put(logPath, fileName + "\n", true)  // true for appending to the file
+}
+
+def extractZipFromDbfsToDbfs(directoryPathDbfs: String, extractionPathDbfs: String, processedFilesLogPath: String): Unit = {
+  val processedFiles = readProcessedFilesLog(processedFilesLogPath)
+
+  // List all zip files in the directory
+  val files = dbutils.fs.ls(directoryPathDbfs).filter(file => file.name.endsWith(".zip"))
+
+  // Filter out files that have already been processed
+  val newZipFiles = files.filterNot(file => processedFiles.contains(file.name))
+
+  newZipFiles.foreach { file =>
+    val zipFileName = file.name
+    println(s"Processing new file: ${file.path}")
+
+    val tmpDir = Files.createTempDirectory("zip_extraction").toString
+
+    try {
+      // Copy the zip file to the temporary directory
+      dbutils.fs.cp(file.path, s"file://$tmpDir/$zipFileName", recurse = false)
+      println(s"File copied to temporary directory: $tmpDir")
+
+      // Unzip the file
+      val unzipCommand = s"unzip $tmpDir/$zipFileName -d $tmpDir"
+      Process(unzipCommand).!!
+
+      // Copy the extracted files, excluding .zip and .crc files and directories
+      Files.list(Paths.get(tmpDir)).iterator().asScala
+        .filter(path => !path.getFileName.toString.endsWith(".zip") && !path.getFileName.toString.endsWith(".crc") && !Files.isDirectory(path))
+        .foreach { filePath =>
+          val dbfsPath = s"$extractionPathDbfs/${filePath.getFileName}"
+          dbutils.fs.cp(s"file://$filePath", dbfsPath, recurse = false)
+          println(s"Copied to DBFS/ABFSS: $dbfsPath")
+        }
+
+      // Log the processed file
+      appendToProcessedFilesLog(processedFilesLogPath, file.name)
+    } catch {
+      case e: Exception => println(s"An error occurred during processing of ${file.path}: ${e.getMessage}")
+    } finally {
+      // Clean up the temporary directory
+      dbutils.fs.rm(s"file://$tmpDir", recurse = true)
+    }
+  }
+
+  if (newZipFiles.isEmpty) {
+    println("No new zip files found to process.")
+  }
+}
+
+--------------------------------------------------------------------------------------------------------------
+
+%scala
+extractZipFromDbfsToDbfs(
+  "dbfs:/mnt/XYZ/zipped/", // Directory containing zip files
+  "dbfs:/mnt/XYZ/extracted/", // Directory where extracted files will be placed
+  "dbfs:/mnt/XYZ/logs/processed_files.log" // Path to the log file storing names of processed zip files
+)
+
+---------------------------------------------------------------------------------------------------------------
+
+# dbutils.fs.mount(source='wasbs://XYZ@databricks0010.blob.core.windows.net',
+#                  mount_point='/mnt/XYZ',
+#                  extra_configs={'fs.azure.account.key.databricks0010.blob.core.windows.net':'Storage account key'})
